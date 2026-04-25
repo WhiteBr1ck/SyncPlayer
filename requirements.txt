@@ -1,0 +1,5 @@
+pywin32>=306
+screeninfo>=0.8.1
+tkinterdnd2>=0.4.3
+customtkinter>=5.2.0
+pyinstaller>=6.0

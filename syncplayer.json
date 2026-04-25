@@ -1,0 +1,20 @@
+{
+  "display": {
+    "mode": "auto",
+    "manual_count": 2,
+    "fullscreen": true
+  },
+  "resume": {
+    "mode": "remember"
+  },
+  "sync": {
+    "seek_threshold_seconds": 0.06,
+    "timepos_throttle_seconds": 0.04
+  },
+  "mpv": {
+    "mute_followers": true,
+    "start_paused": false,
+    "hardware_decoding": true,
+    "extra_args": []
+  }
+}
