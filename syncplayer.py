@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -644,6 +645,7 @@ DEFAULT_CONFIG = {
         "mode": "auto",
         "manual_count": 2,
         "fullscreen": True,
+        "local_sync": True,
     },
     "resume": {
         "mode": "start_over",
@@ -651,6 +653,17 @@ DEFAULT_CONFIG = {
     "sync": {
         "seek_threshold_seconds": 0.06,
         "timepos_throttle_seconds": 0.04,
+    },
+    "remote": {
+        "enabled": False,
+        "mode": "off",
+        "host": "0.0.0.0",
+        "port": 6090,
+        "connect_to": "192.168.1.144:6090",
+        "strong_sync_seconds": 10.0,
+        "correction_interval_seconds": 0.5,
+        "correction_threshold_seconds": 0.08,
+        "large_drift_threshold_seconds": 0.25,
     },
     "mpv": {
         "mute_followers": True,
@@ -914,6 +927,283 @@ class MpvClient:
         self.event_queue.put((self.session_id, "property", self.index, {"name": name, "value": value}))
 
 
+class RemoteJsonPeer:
+    def __init__(self, sock, on_message, on_close=None, name="remote"):
+        self.sock = sock
+        self.on_message = on_message
+        self.on_close = on_close
+        self.name = name
+        self.closed = threading.Event()
+        self.lock = threading.Lock()
+        self.reader = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader.start()
+
+    def send(self, message):
+        if self.closed.is_set():
+            return False
+        try:
+            payload = json.dumps(message, ensure_ascii=False).encode("utf-8") + b"\n"
+            with self.lock:
+                self.sock.sendall(payload)
+            return True
+        except Exception as exc:
+            debug_log(f"REMOTE SEND_FAIL peer={self.name} error={exc}")
+            self.close()
+            return False
+
+    def close(self):
+        if self.closed.is_set():
+            return
+        self.closed.set()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+    def _read_loop(self):
+        buffer = b""
+        try:
+            while not self.closed.is_set():
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        message = json.loads(line.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    self.on_message(self, message)
+        except Exception as exc:
+            if not self.closed.is_set():
+                debug_log(f"REMOTE READ_FAIL peer={self.name} error={exc}")
+        finally:
+            self.close()
+            if self.on_close is not None:
+                self.on_close(self)
+
+
+class RemoteSyncServer:
+    def __init__(self, config, get_state):
+        self.config = config
+        self.get_state = get_state
+        self.sock = None
+        self.peers = []
+        self.lock = threading.Lock()
+        self.running = False
+        self.accept_thread = None
+        self.strong_sync_until = 0.0
+        self.strong_sync_thread = None
+
+    def start(self):
+        remote = self.config.get("remote", {})
+        host = remote.get("host", "0.0.0.0") or "0.0.0.0"
+        port = int(remote.get("port", 6090))
+        self.stop()
+        self.running = True
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((host, port))
+        self.sock.listen(8)
+        self.accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self.accept_thread.start()
+        debug_log(f"REMOTE SERVER_START {host}:{port}")
+
+    def stop(self):
+        self.running = False
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        with self.lock:
+            peers = list(self.peers)
+            self.peers.clear()
+        for peer in peers:
+            peer.close()
+
+    def broadcast(self, message, strong_sync=False):
+        if not self.running:
+            return
+        payload = self._prepare_payload(message)
+        debug_log(f"REMOTE BROADCAST type={payload.get('type')} peers={len(self.peers)}")
+        with self.lock:
+            peers = list(self.peers)
+        for peer in peers:
+            peer.send(payload)
+        if strong_sync:
+            self.start_strong_sync()
+
+    def _prepare_payload(self, message, lead_seconds=0.20):
+        payload = dict(message)
+        now = time.monotonic()
+        payload.setdefault("execute_at", now + lead_seconds)
+        if payload.get("position") is not None and not bool(payload.get("paused", False)):
+            payload["position"] = float(payload["position"]) + max(0.0, float(payload["execute_at"]) - now)
+        return payload
+
+    def _send_current_state(self, peer):
+        state = self.get_state()
+        if state is None or not state.get("path"):
+            debug_log(f"REMOTE WELCOME_SKIP peer={peer.name} reason=no-state")
+            return
+        payload = self._prepare_payload({"type": "open", **state}, lead_seconds=0.50)
+        debug_log(f"REMOTE WELCOME peer={peer.name} path={payload.get('path')} position={payload.get('position')} paused={payload.get('paused')}")
+        peer.send(payload)
+        self.start_strong_sync()
+
+    def start_strong_sync(self):
+        seconds = float(self.config.get("remote", {}).get("strong_sync_seconds", 10.0))
+        self.strong_sync_until = max(self.strong_sync_until, time.monotonic() + seconds)
+        if self.strong_sync_thread is None or not self.strong_sync_thread.is_alive():
+            self.strong_sync_thread = threading.Thread(target=self._strong_sync_loop, daemon=True)
+            self.strong_sync_thread.start()
+
+    def _strong_sync_loop(self):
+        interval = float(self.config.get("remote", {}).get("correction_interval_seconds", 0.5))
+        interval = max(0.10, interval)
+        while self.running and time.monotonic() < self.strong_sync_until:
+            state = self.get_state()
+            if state is not None and state.get("position") is not None:
+                self.broadcast({"type": "state", **state})
+            time.sleep(interval)
+
+    def _accept_loop(self):
+        while self.running and self.sock is not None:
+            try:
+                client_sock, address = self.sock.accept()
+                peer = RemoteJsonPeer(client_sock, self._handle_message, self._remove_peer, name=f"{address[0]}:{address[1]}")
+                with self.lock:
+                    self.peers.append(peer)
+                debug_log(f"REMOTE CLIENT_CONNECTED {address[0]}:{address[1]}")
+                self._send_current_state(peer)
+            except Exception as exc:
+                if self.running:
+                    debug_log(f"REMOTE ACCEPT_FAIL error={exc}")
+                return
+
+    def _remove_peer(self, peer):
+        with self.lock:
+            if peer in self.peers:
+                self.peers.remove(peer)
+        debug_log(f"REMOTE CLIENT_CLOSED peer={peer.name}")
+
+    def _handle_message(self, peer, message):
+        msg_type = message.get("type")
+        if msg_type == "time_sync":
+            peer.send({
+                "type": "time_sync_response",
+                "client_send_time": message.get("client_send_time"),
+                "server_time": time.monotonic(),
+            })
+
+
+class RemoteSyncClient:
+    def __init__(self, config, schedule_command, get_state):
+        self.config = config
+        self.schedule_command = schedule_command
+        self.get_state = get_state
+        self.peer = None
+        self.running = False
+        self.worker = None
+        self.clock_offset = 0.0
+
+    def start(self):
+        self.stop()
+        self.running = True
+        self.worker = threading.Thread(target=self._connect_loop, daemon=True)
+        self.worker.start()
+
+    def stop(self):
+        self.running = False
+        if self.peer is not None:
+            self.peer.close()
+            self.peer = None
+
+    def _connect_loop(self):
+        while self.running:
+            try:
+                host, port = self._parse_connect_to()
+                sock = socket.create_connection((host, port), timeout=5.0)
+                sock.settimeout(None)
+                self.peer = RemoteJsonPeer(sock, self._handle_message, self._peer_closed, name=f"{host}:{port}")
+                debug_log(f"REMOTE CLIENT_CONNECTED_TO {host}:{port}")
+                self._time_sync_loop()
+            except Exception as exc:
+                if self.running:
+                    debug_log(f"REMOTE CONNECT_FAIL error={exc}")
+                    time.sleep(2.0)
+
+    def _parse_connect_to(self):
+        target = self.config.get("remote", {}).get("connect_to", "127.0.0.1:6090")
+        if ":" in target:
+            host, port = target.rsplit(":", 1)
+            return host.strip(), int(port)
+        return target.strip(), int(self.config.get("remote", {}).get("port", 6090))
+
+    def _peer_closed(self, peer):
+        if self.peer is peer:
+            self.peer = None
+        debug_log(f"REMOTE CLIENT_DISCONNECTED peer={peer.name}")
+
+    def _time_sync_loop(self):
+        while self.running and self.peer is not None and not self.peer.closed.is_set():
+            self.peer.send({"type": "time_sync", "client_send_time": time.monotonic()})
+            time.sleep(3.0)
+
+    def _handle_message(self, peer, message):
+        msg_type = message.get("type")
+        debug_log(f"REMOTE CLIENT_RECV type={msg_type}")
+        if msg_type == "time_sync_response":
+            client_send = message.get("client_send_time")
+            server_time = message.get("server_time")
+            if client_send is None or server_time is None:
+                return
+            client_receive = time.monotonic()
+            midpoint = (float(client_send) + client_receive) / 2.0
+            self.clock_offset = float(server_time) - midpoint
+            debug_log(f"REMOTE CLOCK offset={self.clock_offset:.4f}")
+            return
+        self._schedule_remote_message(message)
+
+    def _schedule_remote_message(self, message):
+        execute_at = message.get("execute_at")
+        delay = 0.0
+        if execute_at is not None:
+            local_execute_at = float(execute_at) - self.clock_offset
+            delay = max(0.0, local_execute_at - time.monotonic())
+        timer = threading.Timer(delay, self._execute_message, args=(message,))
+        timer.daemon = True
+        timer.start()
+
+    def _execute_message(self, message):
+        msg_type = message.get("type")
+        debug_log(f"REMOTE CLIENT_EXEC type={msg_type} path={message.get('path')} position={message.get('position')}")
+        if msg_type == "state":
+            state = self.get_state()
+            if state is None or state.get("position") is None or message.get("position") is None:
+                return
+            if bool(state.get("paused")) != bool(message.get("paused")):
+                self.schedule_command({"type": "pause", "paused": bool(message.get("paused")), "remote": True})
+                return
+            if bool(message.get("paused")):
+                return
+            drift = abs(float(state["position"]) - float(message["position"]))
+            threshold = float(self.config.get("remote", {}).get("large_drift_threshold_seconds", 0.25))
+            if drift >= threshold:
+                self.schedule_command({"type": "seek", "position": float(message["position"]), "remote": True})
+            return
+        self.schedule_command(dict(message, remote=True))
+
+
 class SyncController:
     def __init__(self, base_dir, config):
         self.base_dir = base_dir
@@ -934,18 +1224,88 @@ class SyncController:
         self.sync_source_index = 0
         self.sync_source_until = 0.0
         self.session_id = 0
+        self.current_video_path = None
+        self.event_callback = None
 
-    def start(self, video_path):
+    def set_event_callback(self, callback):
+        self.event_callback = callback
+
+    def remote_state(self):
+        source = self.clients.get(0) or next(iter(self.clients.values()), None)
+        if source is None:
+            return None
+        return {
+            "path": str(self.current_video_path) if self.current_video_path is not None else None,
+            "position": source.time_pos,
+            "paused": bool(source.pause),
+            "fullscreen": bool(source.fullscreen),
+        }
+
+    def set_pause(self, paused):
+        for client in list(self.clients.values()):
+            client.set_property("pause", bool(paused))
+
+    def seek_all(self, seconds):
+        for client in list(self.clients.values()):
+            client.seek_absolute(float(seconds))
+
+    def set_fullscreen(self, fullscreen):
+        fullscreen = bool(fullscreen)
+        if fullscreen:
+            self._apply_all_window_placements(self.session_id, fullscreen=True)
+        for index, client in list(self.clients.items()):
+            if fullscreen:
+                move_mpv_window_to_monitor(client.process, client.expected_monitor, index, fullscreen=True)
+            client.set_property("fullscreen", fullscreen)
+        if not fullscreen:
+            self._schedule_windowed_geometry_fix(self.session_id)
+
+    def apply_remote_command(self, command):
+        msg_type = command.get("type")
+        if msg_type == "open":
+            path = command.get("path")
+            if path:
+                self.start(Path(path), notify_remote=False)
+                position = command.get("position")
+                if position is not None and float(position) > 0:
+                    self.seek_all(float(position))
+                if "paused" in command:
+                    self.set_pause(bool(command.get("paused")))
+            return
+        if msg_type == "pause":
+            self.set_pause(bool(command.get("paused")))
+            return
+        if msg_type == "seek":
+            position = command.get("position")
+            if position is not None:
+                self.seek_all(float(position))
+            return
+        if msg_type == "fullscreen":
+            self.set_fullscreen(bool(command.get("fullscreen")))
+            return
+        if msg_type == "close":
+            self.stop(notify_remote=False)
+
+    def _notify_remote(self, message, strong_sync=False):
+        if self.event_callback is None:
+            return
+        try:
+            self.event_callback(message, strong_sync=strong_sync)
+        except Exception as exc:
+            debug_log(f"REMOTE CALLBACK_FAIL error={exc}")
+
+    def start(self, video_path, notify_remote=True):
         if not self.mpv_path.exists():
             raise FileNotFoundError(f"找不到同目录 mpv: {self.mpv_path}")
         if win32file is None:
             raise RuntimeError("缺少 pywin32，无法使用 mpv IPC。请先运行 pip install -r requirements.txt")
 
         debug_log(f"START video={video_path}")
-        self.stop()
+        self.stop(notify_remote=False)
         self._clear_events()
         self.session_id += 1
         session_id = self.session_id
+        self.current_video_path = Path(video_path)
         monitors = get_display_layout()
         count = output_count(self.config, monitors)
         display_mode = self.config["display"].get("mode")
@@ -995,9 +1355,12 @@ class SyncController:
 
         self.worker = threading.Thread(target=self._sync_loop, args=(session_id,), daemon=True)
         self.worker.start()
+        if notify_remote:
+            self._notify_remote({"type": "open", "path": str(video_path), "position": 0.0, "paused": False}, strong_sync=True)
 
-    def stop(self):
+    def stop(self, notify_remote=True):
         debug_log("STOP")
+        was_running = self.running or bool(self.clients) or bool(self.processes)
         self.running = False
         for client in self.clients.values():
             client.close()
@@ -1013,8 +1376,11 @@ class SyncController:
                     pass
         self.processes.clear()
         self.process_by_index.clear()
+        self.current_video_path = None
         if self.worker and self.worker.is_alive():
             self.worker.join(timeout=0.2)
+        if notify_remote and was_running:
+            self._notify_remote({"type": "close"})
 
     def _clear_events(self):
         while True:
@@ -1137,6 +1503,7 @@ class SyncController:
                 elif event_type in {"ipc_closed", "shutdown"}:
                     self._quit_peers(index)
                     self.running = False
+                    self._notify_remote({"type": "close"})
             except queue.Empty:
                 pass
 
@@ -1154,6 +1521,7 @@ class SyncController:
         debug_log(f"CTRL HANDLE P{index} {name}={value}")
         if name == "pause":
             is_paused = bool(value)
+            position = source.time_pos
             if not is_paused and self.pending_seek_source_index is not None:
                 pending_source = self.clients.get(self.pending_seek_source_index)
                 if pending_source is not None and pending_source.time_pos is not None:
@@ -1163,11 +1531,13 @@ class SyncController:
                     return
                 self.pending_seek_source_index = None
             self._broadcast_property(index, "pause", is_paused)
+            self._notify_remote({"type": "pause", "paused": is_paused, "position": position}, strong_sync=not is_paused)
         elif name == "fullscreen":
             is_fullscreen = bool(value)
             if is_fullscreen:
                 self._apply_all_window_placements(self.session_id, fullscreen=True)
             self._broadcast_property(index, "fullscreen", is_fullscreen)
+            self._notify_remote({"type": "fullscreen", "fullscreen": is_fullscreen})
             if not is_fullscreen:
                 self._schedule_windowed_geometry_fix(self.session_id)
         elif name == "time-pos" and value is not None:
@@ -1326,6 +1696,7 @@ class SyncController:
             if index != source.index:
                 target.seek_absolute(value)
         self.last_seek_sync[source.index] = now
+        self._notify_remote({"type": "seek", "position": value, "paused": bool(source.pause)}, strong_sync=True)
 
 def setup_dpi_awareness():
     global DPI_SCALE
@@ -1368,6 +1739,7 @@ def migrate_config(config):
         config["display"].setdefault("mode", "manual")
         config["display"].setdefault("manual_count", 2)
         config["display"].setdefault("fullscreen", True)
+        config["display"].setdefault("local_sync", True)
     if "mute_right" in config.get("mpv", {}):
         config["mpv"]["mute_followers"] = config["mpv"].pop("mute_right")
 
@@ -1388,6 +1760,8 @@ def get_display_layout():
 
 def output_count(config, monitors):
     display = config["display"]
+    if not bool(display.get("local_sync", True)):
+        return 1
     if display.get("mode") == "manual":
         return max(1, int(display.get("manual_count", 2)))
     return max(1, len(monitors))
@@ -1493,6 +1867,8 @@ class SyncPlayerApp:
         debug_log("=== SyncPlayer started ===")
         self.config = load_config(self.base_dir)
         self.controller = SyncController(self.base_dir, self.config)
+        self.remote_server = None
+        self.remote_client = None
         self.initial_video = initial_video
 
         self.font_family = "Microsoft YaHei UI"
@@ -1507,11 +1883,12 @@ class SyncPlayerApp:
             self.root.tk.call("tk", "scaling", 1.35)
         except Exception:
             pass
-        self.root.geometry("800x560")
-        self.root.minsize(760, 540)
+        self.root.geometry("860x680")
+        self.root.minsize(820, 640)
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build_ui()
+        self._configure_remote_sync()
         self._register_drop_target()
 
         if self.initial_video is not None:
@@ -1637,14 +2014,155 @@ class SyncPlayerApp:
         if hasattr(self, "status_text"):
             self.status_text.set(text)
 
+    def _configure_remote_sync(self):
+        if self.remote_server is not None:
+            self.remote_server.stop()
+            self.remote_server = None
+        if self.remote_client is not None:
+            self.remote_client.stop()
+            self.remote_client = None
+        self.controller.set_event_callback(None)
+
+        remote_config = self.config.get("remote", {})
+        mode = remote_config.get("mode", "off") if remote_config.get("enabled", False) else "off"
+        if mode == "host":
+            self.remote_server = RemoteSyncServer(self.config, self.controller.remote_state)
+            try:
+                self.remote_server.start()
+                self.controller.set_event_callback(self._broadcast_remote_event)
+                self._set_status(f"局域网同步：主机监听 {self.config['remote'].get('host', '0.0.0.0')}:{self.config['remote'].get('port', 6090)}")
+            except Exception as exc:
+                debug_log(f"REMOTE SERVER_START_FAIL error={exc}")
+                self.remote_server = None
+                self._set_status(f"局域网同步主机启动失败：{exc}")
+        elif mode == "client":
+            self.remote_client = RemoteSyncClient(self.config, self._schedule_remote_command, self.controller.remote_state)
+            self.remote_client.start()
+            self._set_status(f"局域网同步：正在连接 {self.config['remote'].get('connect_to', '')}")
+
+    def _broadcast_remote_event(self, message, strong_sync=False):
+        if self.remote_server is not None:
+            self.remote_server.broadcast(message, strong_sync=strong_sync)
+
+    def _schedule_remote_command(self, command):
+        self.root.after(0, lambda: self._apply_remote_command(command))
+
+    def _apply_remote_command(self, command):
+        try:
+            self.controller.config = self.config
+            if command.get("type") == "open" and command.get("path"):
+                self._set_status(f"远程启动播放器：{Path(command['path']).name}")
+            self.controller.apply_remote_command(command)
+            if command.get("type") == "open" and command.get("path"):
+                self.root.attributes("-topmost", False)
+                self._set_status(f"远程播放：{Path(command['path']).name}")
+        except Exception as exc:
+            debug_log(f"REMOTE APPLY_FAIL command={command} error={exc}")
+            self._set_status("远程同步命令执行失败，请查看日志。")
+
+    def _parse_remote_target(self):
+        target = self.remote_connect_to.get().strip()
+        if not target:
+            raise ValueError("请先填写主机地址，例如 192.168.1.144:6090。")
+        if ":" in target:
+            host, port = target.rsplit(":", 1)
+            return host.strip(), int(port)
+        return target, int(self.remote_port.get())
+
+    def confirm_remote_host(self):
+        try:
+            port = int(self.remote_port.get())
+            if port < 1 or port > 65535:
+                raise ValueError
+            self.remote_host_confirmed = True
+            self._set_status(f"已确认监听设置：{self.remote_host.get().strip() or '0.0.0.0'}:{port}")
+        except Exception:
+            messagebox.showerror(APP_NAME, "端口必须是 1 到 65535 之间的数字，例如 6090。")
+
+    def confirm_remote_connect_to(self):
+        try:
+            host, port = self._parse_remote_target()
+            if not host or port < 1 or port > 65535:
+                raise ValueError
+            self.remote_connect_confirmed = True
+            self._set_status(f"已确认主机地址：{host}:{port}")
+        except Exception:
+            messagebox.showerror(APP_NAME, "主机地址格式不正确，例如 192.168.1.144:6090。")
+
+    def test_remote_connection(self):
+        try:
+            host, port = self._parse_remote_target()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self._set_status(f"正在测试连接：{host}:{port}")
+        threading.Thread(target=self._test_remote_connection_worker, args=(host, port), daemon=True).start()
+
+    def _test_remote_connection_worker(self, host, port):
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=3.0)
+            sock.settimeout(3.0)
+            request = {"type": "time_sync", "client_send_time": time.monotonic()}
+            sock.sendall(json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n")
+            buffer = b""
+            deadline = time.monotonic() + 3.0
+            response_ok = False
+            while time.monotonic() < deadline:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    message = json.loads(line.decode("utf-8", errors="replace"))
+                    if message.get("type") == "time_sync_response":
+                        response_ok = True
+                        break
+                if response_ok:
+                    break
+            if not response_ok:
+                raise RuntimeError("端口可连接，但没有收到 SyncPlayer 主机协议响应。")
+            self.root.after(0, lambda: self._set_status(f"连接成功：{host}:{port}"))
+            self.root.after(0, lambda: messagebox.showinfo(APP_NAME, f"连接成功：{host}:{port}"))
+        except Exception as exc:
+            debug_log(f"REMOTE TEST_FAIL target={host}:{port} error={exc}")
+            self.root.after(0, lambda: self._set_status(f"连接失败：{host}:{port}"))
+            self.root.after(0, lambda: messagebox.showerror(APP_NAME, f"连接失败：{host}:{port}\n\n{exc}"))
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def apply_remote_settings(self):
+        try:
+            self.apply_ui_to_config()
+            save_config(self.base_dir, self.config)
+            self._configure_remote_sync()
+            self._set_status("局域网同步设置已应用。")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"应用失败：\n{exc}")
+
     def _build_ui(self):
         self.drop_widgets = []
         self.display_mode = StringVar(value=self.config["display"].get("mode", "auto"))
         self.manual_count = IntVar(value=int(self.config["display"].get("manual_count", 2)))
         self.fullscreen = BooleanVar(value=bool(self.config["display"].get("fullscreen", True)))
+        self.local_sync = BooleanVar(value=bool(self.config["display"].get("local_sync", True)))
         self.resume_mode = StringVar(value=self.config["resume"].get("mode", "start_over"))
         self.mute_followers = BooleanVar(value=bool(self.config["mpv"].get("mute_followers", True)))
         self.hardware_decoding = BooleanVar(value=bool(self.config["mpv"].get("hardware_decoding", True)))
+        self.remote_enabled = BooleanVar(value=bool(self.config.get("remote", {}).get("enabled", False)))
+        self.remote_mode = StringVar(value=self.config.get("remote", {}).get("mode", "off"))
+        self.remote_host = StringVar(value=self.config.get("remote", {}).get("host", "0.0.0.0"))
+        self.remote_port = IntVar(value=int(self.config.get("remote", {}).get("port", 6090)))
+        self.remote_connect_to = StringVar(value=self.config.get("remote", {}).get("connect_to", "192.168.1.144:6090"))
+        self.remote_host_confirmed = False
+        self.remote_connect_confirmed = False
         self.status_text = StringVar(value="等待视频：拖入视频文件，或点击按钮选择视频。")
 
         self.root.grid_columnconfigure(0, weight=1)
@@ -1720,9 +2238,10 @@ class SyncPlayerApp:
         ctk.CTkRadioButton(display_card, text="手动指定数量", variable=self.display_mode, value="manual", font=self._font(14)).grid(row=2, column=0, sticky="w", padx=16, pady=6)
         ctk.CTkEntry(display_card, textvariable=self.manual_count, width=72, font=self._font(14), justify="center").grid(row=2, column=1, sticky="w", padx=(0, 10), pady=6)
         ctk.CTkButton(display_card, text="检测", command=self.show_screen_count, width=76, height=32, font=self._font(13)).grid(row=2, column=2, sticky="e", padx=(0, 16), pady=6)
-        ctk.CTkCheckBox(display_card, text="默认全屏", variable=self.fullscreen, font=self._font(14)).grid(row=3, column=0, columnspan=3, sticky="w", padx=16, pady=(12, 6))
-        ctk.CTkCheckBox(display_card, text="第 2 个及之后默认静音", variable=self.mute_followers, font=self._font(14)).grid(row=4, column=0, columnspan=3, sticky="w", padx=16, pady=6)
-        ctk.CTkCheckBox(display_card, text="启用硬件解码", variable=self.hardware_decoding, font=self._font(14)).grid(row=5, column=0, columnspan=3, sticky="w", padx=16, pady=(6, 16))
+        ctk.CTkCheckBox(display_card, text="启用本机多屏同步", variable=self.local_sync, font=self._font(14)).grid(row=3, column=0, columnspan=3, sticky="w", padx=16, pady=(12, 6))
+        ctk.CTkCheckBox(display_card, text="默认全屏", variable=self.fullscreen, font=self._font(14)).grid(row=4, column=0, columnspan=3, sticky="w", padx=16, pady=6)
+        ctk.CTkCheckBox(display_card, text="第 2 个及之后默认静音", variable=self.mute_followers, font=self._font(14)).grid(row=5, column=0, columnspan=3, sticky="w", padx=16, pady=6)
+        ctk.CTkCheckBox(display_card, text="启用硬件解码", variable=self.hardware_decoding, font=self._font(14)).grid(row=6, column=0, columnspan=3, sticky="w", padx=16, pady=(6, 16))
 
         playback_card = ctk.CTkFrame(settings, corner_radius=10)
         playback_card.grid(row=0, column=1, sticky="nsew", padx=(7, 14), pady=14)
@@ -1739,8 +2258,28 @@ class SyncPlayerApp:
             corner_radius=10,
         ).grid(row=3, column=0, sticky="ew", padx=16, pady=(18, 16))
 
+        remote_card = ctk.CTkFrame(content, corner_radius=12)
+        remote_card.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 12))
+        remote_card.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(remote_card, text="局域网同步", font=self._font(17, "bold"), anchor="w").grid(row=0, column=0, columnspan=4, sticky="ew", padx=16, pady=(14, 8))
+        ctk.CTkCheckBox(remote_card, text="启用局域网同步", variable=self.remote_enabled, font=self._font(14)).grid(row=1, column=0, columnspan=4, sticky="w", padx=16, pady=6)
+        ctk.CTkRadioButton(remote_card, text="作为主机", variable=self.remote_mode, value="host", font=self._font(14)).grid(row=2, column=0, sticky="w", padx=16, pady=6)
+        ctk.CTkRadioButton(remote_card, text="作为从机", variable=self.remote_mode, value="client", font=self._font(14)).grid(row=2, column=1, sticky="w", padx=8, pady=6)
+
+        ctk.CTkLabel(remote_card, text="主机监听地址", font=self._font(13), anchor="w").grid(row=3, column=0, sticky="w", padx=16, pady=(10, 4))
+        ctk.CTkEntry(remote_card, textvariable=self.remote_host, width=150, font=self._font(13)).grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 10))
+        ctk.CTkLabel(remote_card, text="端口", font=self._font(13), anchor="w").grid(row=3, column=1, sticky="w", padx=8, pady=(10, 4))
+        ctk.CTkEntry(remote_card, textvariable=self.remote_port, width=90, font=self._font(13), justify="center").grid(row=4, column=1, sticky="w", padx=8, pady=(0, 10))
+        ctk.CTkButton(remote_card, text="确认监听设置", command=self.confirm_remote_host, width=120, height=32, font=self._font(13)).grid(row=4, column=2, sticky="w", padx=8, pady=(0, 10))
+
+        ctk.CTkLabel(remote_card, text="从机连接主机地址，例如 192.168.1.144:6090", font=self._font(13), anchor="w").grid(row=5, column=0, columnspan=4, sticky="w", padx=16, pady=(4, 4))
+        ctk.CTkEntry(remote_card, textvariable=self.remote_connect_to, font=self._font(13)).grid(row=6, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 14))
+        ctk.CTkButton(remote_card, text="确认主机地址", command=self.confirm_remote_connect_to, width=120, height=32, font=self._font(13)).grid(row=6, column=2, sticky="w", padx=8, pady=(0, 14))
+        ctk.CTkButton(remote_card, text="测试连接", command=self.test_remote_connection, width=100, height=32, font=self._font(13)).grid(row=6, column=3, sticky="w", padx=(0, 16), pady=(0, 14))
+        ctk.CTkButton(remote_card, text="应用局域网设置", command=self.apply_remote_settings, height=34, font=self._font(13, "bold")).grid(row=7, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 14))
+
         status_bar = ctk.CTkFrame(content, corner_radius=10, fg_color=("#dfe6ef", "#151c26"))
-        status_bar.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
+        status_bar.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
         status_bar.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             status_bar,
@@ -1802,18 +2341,47 @@ class SyncPlayerApp:
             raise ValueError("手动屏幕数量必须至少为 1。")
         if manual_count > 16:
             raise ValueError("手动屏幕数量不能超过 16。")
+        try:
+            remote_port = int(self.remote_port.get())
+        except Exception as exc:
+            raise ValueError("远程同步端口必须是数字。") from exc
+        if remote_port < 1 or remote_port > 65535:
+            raise ValueError("远程同步端口必须在 1 到 65535 之间。")
+        remote_mode = self.remote_mode.get()
+        if remote_mode not in {"off", "host", "client"}:
+            remote_mode = "off"
+        remote_enabled = bool(self.remote_enabled.get())
+        if not remote_enabled:
+            remote_mode = "off"
+        remote_host = self.remote_host.get().strip() or "0.0.0.0"
+        remote_connect_to = self.remote_connect_to.get().strip()
+        if remote_enabled and remote_mode == "off":
+            raise ValueError("启用局域网同步后，请选择作为主机或作为从机。")
+        if remote_enabled and remote_mode == "host" and not self.remote_host_confirmed:
+            raise ValueError("请先点击“确认监听设置”。")
+        if remote_enabled and remote_mode == "client" and not self.remote_connect_confirmed:
+            raise ValueError("请先点击“确认主机地址”。")
+        if remote_enabled and remote_mode == "client" and not remote_connect_to:
+            raise ValueError("作为从机时必须填写主机地址，例如 192.168.1.144:6090。")
         self.config["display"]["mode"] = self.display_mode.get()
         self.config["display"]["manual_count"] = manual_count
         self.config["display"]["fullscreen"] = bool(self.fullscreen.get())
+        self.config["display"]["local_sync"] = bool(self.local_sync.get())
         self.config["resume"]["mode"] = self.resume_mode.get()
         self.config["mpv"]["mute_followers"] = bool(self.mute_followers.get())
         self.config["mpv"]["hardware_decoding"] = bool(self.hardware_decoding.get())
+        self.config.setdefault("remote", {})["enabled"] = remote_enabled
+        self.config.setdefault("remote", {})["mode"] = remote_mode
+        self.config["remote"]["host"] = remote_host
+        self.config["remote"]["port"] = remote_port
+        self.config["remote"]["connect_to"] = remote_connect_to
         self.config.setdefault("ui", {})["theme"] = self.theme_mode.get()
 
     def save_settings(self):
         try:
             self.apply_ui_to_config()
             save_config(self.base_dir, self.config)
+            self._configure_remote_sync()
             self._set_status("设置已保存。")
             messagebox.showinfo(APP_NAME, "设置已保存。")
         except Exception as exc:
@@ -1829,6 +2397,10 @@ class SyncPlayerApp:
         messagebox.showinfo(APP_NAME, f"检测到 {len(monitors)} 个屏幕。\n\n{details}")
 
     def on_close(self):
+        if self.remote_server is not None:
+            self.remote_server.stop()
+        if self.remote_client is not None:
+            self.remote_client.stop()
         self.controller.stop()
         self.root.destroy()
 
