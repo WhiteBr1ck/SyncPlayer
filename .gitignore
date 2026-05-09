@@ -15,6 +15,7 @@ build.bat
 CLAUDE.md
 
 # Local runtime logs and user state
+syncplayer.json
 syncplayer-debug.log
 *.log
 
