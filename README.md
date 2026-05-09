@@ -1,77 +1,37 @@
 # SyncPlayer
 
-SyncPlayer is a portable Windows launcher for synchronized mpv playback across local displays and LAN-connected computers.
+SyncPlayer 是一个 Windows 便携式 mpv 启动器，用于本机多屏视频同步播放和局域网多电脑同步播放。
 
-## Features
+## 功能
 
-- Open one video file in one or more mpv windows.
-- Synchronize play, pause, seek, fullscreen, windowed mode, and close events.
-- Use local multi-screen sync on one computer.
-- Use LAN sync between multiple computers running SyncPlayer.
-- Run as a LAN host or connect as a LAN client.
-- Test LAN host connectivity before playback.
-- Use existing mpv portable configuration without overriding rendering settings.
-- Optional playback settings for fullscreen, follower mute, subtitles, resume mode, and hardware decoding.
+- 打开一个视频文件，并启动一个或多个 mpv 播放窗口。
+- 同步播放、暂停、跳转进度、全屏、窗口化和关闭操作。
+- 支持同一台电脑上的本机多屏同步。
+- 支持局域网内多台电脑运行 SyncPlayer 后同步播放。
 
-## Requirements
+## 局域网同步
 
-- Windows
-- Python 3.13 or newer for source runs
-- Dependencies from `requirements.txt`
-- Bundled `mpv` folder next to `syncplayer.py` or `SyncPlayer.exe`
+主机电脑：
 
-## Run From Source
+- 启用局域网多屏同步。
+- 选择作为主机。
+- 设置监听地址和端口。
+- 保存局域网设置。
 
-```bat
-python -m pip install -r requirements.txt
-python syncplayer.py
-```
+从机电脑：
 
-Open a file directly:
+- 启用局域网多屏同步。
+- 选择作为从机。
+- 输入主机 IP 地址和端口。
+- 测试连接。
+- 保存局域网设置。
 
-```bat
-python syncplayer.py "D:\path\to\video.mp4"
-```
+注意：所有电脑需要能访问相同的视频文件路径（比如局域网SMB网络路径）。
 
-## Build
+## 本地配置
 
-```bat
-build.bat
-```
-
-The build creates:
-
-```text
-dist\SyncPlayer.exe
-```
-
-Keep the `mpv` folder next to the executable when distributing.
-
-## LAN Sync
-
-On the host computer:
-
-- Enable LAN multi-screen sync.
-- Select host mode.
-- Set the listen address and port.
-- Save LAN settings.
-
-On each client computer:
-
-- Enable LAN multi-screen sync.
-- Select client mode.
-- Enter the host IP address and port.
-- Test the connection.
-- Save LAN settings.
-
-All computers must be able to access the same video file path.
-
-## Local Config
-
-User settings are stored in:
+用户设置保存在：
 
 ```text
 syncplayer.json
 ```
-
-This file is local user state and is not intended to be committed.
