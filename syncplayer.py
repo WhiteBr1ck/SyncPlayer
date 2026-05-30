@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import BooleanVar, IntVar, PhotoImage, StringVar, filedialog, messagebox
+from tkinter import BooleanVar, DoubleVar, IntVar, PhotoImage, StringVar, filedialog, messagebox
 
 import customtkinter as ctk
 from PIL import Image
@@ -42,10 +42,13 @@ except ImportError:
 
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "0.0.6"
+APP_VERSION = "0.0.7"
 DPI_SCALE = 1.0
 DEBUG_LOG_PATH = None
 DEBUG_LOG_LOCK = threading.Lock()
+DEFAULT_LARGE_DRIFT_THRESHOLD_SECONDS = 0.25
+MIN_LARGE_DRIFT_THRESHOLD_SECONDS = 0.05
+MAX_LARGE_DRIFT_THRESHOLD_SECONDS = 1.00
 DEFAULT_CONFIG = {
     "display": {
         "mode": "auto",
@@ -59,6 +62,7 @@ DEFAULT_CONFIG = {
     "sync": {
         "seek_threshold_seconds": 0.06,
         "timepos_throttle_seconds": 0.04,
+        "large_drift_threshold_seconds": DEFAULT_LARGE_DRIFT_THRESHOLD_SECONDS,
     },
     "remote": {
         "enabled": False,
@@ -69,11 +73,12 @@ DEFAULT_CONFIG = {
         "strong_sync_seconds": 10.0,
         "correction_interval_seconds": 0.5,
         "correction_threshold_seconds": 0.08,
-        "large_drift_threshold_seconds": 0.25,
     },
     "mpv": {
+        "mute_all": False,
         "mute_followers": True,
         "disable_subtitles": False,
+        "end_behavior": "pause_last_frame",
         "start_paused": False,
         "hardware_decoding": True,
         "extra_args": [],
@@ -140,6 +145,7 @@ class MpvClient:
         self.pause = None
         self.seeking = False
         self.fullscreen = None
+        self.eof_reached = False
         self.display_names = []
         self.osd_dimensions = None
         self.ignore = {}
@@ -185,6 +191,7 @@ class MpvClient:
         self.observe_property(7, "current-window-scale")
         self.observe_property(8, "window-minimized")
         self.observe_property(9, "window-maximized")
+        self.observe_property(10, "eof-reached")
 
     def observe_property(self, observer_id, name):
         self.command(["observe_property", observer_id, name])
@@ -345,8 +352,13 @@ class MpvClient:
         elif name in {"current-window-scale", "window-minimized", "window-maximized"}:
             debug_log(f"P{self.index} WINDOW_PROP {name}={value}")
             return
+        elif name == "eof-reached":
+            old_value = getattr(self, "eof_reached", False)
+            new_value = bool(value)
+            changed = old_value != new_value
+            self.eof_reached = new_value
 
-        if name in {"pause", "seeking", "fullscreen"}:
+        if name in {"pause", "seeking", "fullscreen", "eof-reached"}:
             debug_log(
                 f"P{self.index} EVENT {name}={value} old={old_value} changed={changed} suppress={suppress_broadcast}"
             )
@@ -354,7 +366,7 @@ class MpvClient:
         if suppress_broadcast:
             debug_log(f"P{self.index} DROP {name} reason=ignore")
             return
-        if name in {"seeking", "fullscreen"} and not changed:
+        if name in {"seeking", "fullscreen", "eof-reached"} and not changed:
             debug_log(f"P{self.index} DROP {name} reason=unchanged")
             return
 
@@ -623,6 +635,7 @@ class RemoteSyncClient:
         msg_type = message.get("type")
         debug_log(f"REMOTE CLIENT_EXEC type={msg_type} path={message.get('path')} position={message.get('position')}")
         if msg_type == "state":
+            sync_config = self.config.get("sync", {})
             state = self.get_state()
             if state is None or state.get("position") is None or message.get("position") is None:
                 return
@@ -632,7 +645,7 @@ class RemoteSyncClient:
             if bool(message.get("paused")):
                 return
             drift = abs(float(state["position"]) - float(message["position"]))
-            threshold = float(self.config.get("remote", {}).get("large_drift_threshold_seconds", 0.25))
+            threshold = float(sync_config.get("large_drift_threshold_seconds", DEFAULT_LARGE_DRIFT_THRESHOLD_SECONDS))
             if drift >= threshold:
                 self.schedule_command({"type": "seek", "position": float(message["position"]), "remote": True})
             return
@@ -661,6 +674,9 @@ class SyncController:
         self.session_id = 0
         self.current_video_path = None
         self.event_callback = None
+        self.remote_playback_options = None
+        self.active_playback_options = None
+        self.next_episode_pending = False
 
     def set_event_callback(self, callback):
         self.event_callback = callback
@@ -674,7 +690,37 @@ class SyncController:
             "position": source.time_pos,
             "paused": bool(source.pause),
             "fullscreen": bool(source.fullscreen),
+            "playback_options": self._playback_options(),
         }
+
+    def _mpv_config(self):
+        mpv_config = dict(self.config.get("mpv", {}))
+        if self.remote_playback_options:
+            mpv_config.update(self.remote_playback_options)
+        return mpv_config
+
+    def _playback_options(self):
+        mpv_config = self._mpv_config()
+        return {
+            "mute_all": bool(mpv_config.get("mute_all", False)),
+            "mute_followers": bool(mpv_config.get("mute_followers", True)),
+            "disable_subtitles": bool(mpv_config.get("disable_subtitles", False)),
+            "end_behavior": mpv_config.get("end_behavior", "pause_last_frame"),
+            "start_paused": bool(mpv_config.get("start_paused", False)),
+            "hardware_decoding": bool(mpv_config.get("hardware_decoding", True)),
+        }
+
+    def _active_end_behavior(self):
+        if self.active_playback_options:
+            return self.active_playback_options.get("end_behavior", "pause_last_frame")
+        return self._mpv_config().get("end_behavior", "pause_last_frame")
+
+    def _is_remote_client_mode(self):
+        remote = self.config.get("remote", {})
+        return bool(remote.get("enabled", False)) and remote.get("mode") == "client"
+
+    def _large_drift_threshold(self):
+        return float(self.config.get("sync", {}).get("large_drift_threshold_seconds", DEFAULT_LARGE_DRIFT_THRESHOLD_SECONDS))
 
     def set_pause(self, paused):
         for client in list(self.clients.values()):
@@ -700,12 +746,17 @@ class SyncController:
         if msg_type == "open":
             path = command.get("path")
             if path:
-                self.start(Path(path), notify_remote=False)
-                position = command.get("position")
-                if position is not None and float(position) > 0:
-                    self.seek_all(float(position))
-                if "paused" in command:
-                    self.set_pause(bool(command.get("paused")))
+                previous_options = self.remote_playback_options
+                self.remote_playback_options = command.get("playback_options") or command.get("mpv") or None
+                try:
+                    self.start(Path(path), notify_remote=False)
+                    position = command.get("position")
+                    if position is not None and float(position) > 0:
+                        self.seek_all(float(position))
+                    if "paused" in command:
+                        self.set_pause(bool(command.get("paused")))
+                finally:
+                    self.remote_playback_options = previous_options
             return
         if msg_type == "pause":
             self.set_pause(bool(command.get("paused")))
@@ -720,6 +771,55 @@ class SyncController:
             return
         if msg_type == "close":
             self.stop(notify_remote=False)
+
+    def _sibling_videos(self, video_path):
+        try:
+            parent = video_path.parent
+            return sorted(
+                [path for path in parent.iterdir() if path.is_file() and is_video_file(path)],
+                key=lambda path: os.path.normcase(path.name),
+            )
+        except Exception as exc:
+            debug_log(f"CTRL NEXT_LIST_FAIL path={video_path} error={exc}")
+            return []
+
+    def _next_episode_path(self):
+        if self.current_video_path is None:
+            return None
+        current = self.current_video_path.resolve()
+        siblings = self._sibling_videos(current)
+        for index, path in enumerate(siblings):
+            try:
+                if path.resolve() == current and index + 1 < len(siblings):
+                    return siblings[index + 1]
+            except Exception:
+                continue
+        return None
+
+    def _advance_to_next_episode(self, session_id):
+        if not self.running or session_id != self.session_id:
+            return
+        if self.next_episode_pending:
+            return
+        self.next_episode_pending = True
+        timer = threading.Timer(0.05, self._open_next_episode, args=(session_id,))
+        timer.daemon = True
+        timer.start()
+
+    def _open_next_episode(self, session_id):
+        if not self.running or session_id != self.session_id:
+            self.next_episode_pending = False
+            return
+        next_path = self._next_episode_path()
+        debug_log(f"CTRL NEXT_EPISODE current={self.current_video_path} next={next_path}")
+        if next_path is None:
+            self.next_episode_pending = False
+            self.set_pause(True)
+            return
+        try:
+            self.start(next_path, notify_remote=True)
+        finally:
+            self.next_episode_pending = False
 
     def _notify_remote(self, message, strong_sync=False):
         if self.event_callback is None:
@@ -741,6 +841,7 @@ class SyncController:
         self.session_id += 1
         session_id = self.session_id
         self.current_video_path = Path(video_path)
+        self.active_playback_options = self._playback_options()
         monitors = get_display_layout()
         count = output_count(self.config, monitors)
         display_mode = self.config["display"].get("mode")
@@ -759,6 +860,7 @@ class SyncController:
         self.pending_seek_source_index = None
         self.pending_drag_seek = None
         self.pending_drag_timer = None
+        self.next_episode_pending = False
         self.post_seek_check_generation += 1
         self.sync_source_index = 0
         self.sync_source_until = 0.0
@@ -781,12 +883,14 @@ class SyncController:
             client.connect()
             self.clients[index] = client
 
-        if self.config["mpv"].get("disable_subtitles", False):
+        mpv_config = self._mpv_config()
+
+        if mpv_config.get("disable_subtitles", False):
             for client in self.clients.values():
                 client.set_property("sid", "no")
                 client.set_property("sub-visibility", False)
 
-        if self.config["mpv"].get("start_paused", False):
+        if mpv_config.get("start_paused", False):
             for client in self.clients.values():
                 client.set_property("pause", True)
 
@@ -796,7 +900,14 @@ class SyncController:
         self.worker = threading.Thread(target=self._sync_loop, args=(session_id,), daemon=True)
         self.worker.start()
         if notify_remote:
-            self._notify_remote({"type": "open", "path": str(video_path), "position": 0.0, "paused": False}, strong_sync=True)
+            start_paused = bool(self._mpv_config().get("start_paused", False))
+            self._notify_remote({
+                "type": "open",
+                "path": str(video_path),
+                "position": 0.0,
+                "paused": start_paused,
+                "playback_options": self._playback_options(),
+            }, strong_sync=True)
 
     def stop(self, notify_remote=True):
         debug_log("STOP")
@@ -817,6 +928,7 @@ class SyncController:
         self.processes.clear()
         self.process_by_index.clear()
         self.current_video_path = None
+        self.active_playback_options = None
         if self.worker and self.worker.is_alive():
             self.worker.join(timeout=0.2)
         if notify_remote and was_running:
@@ -831,6 +943,7 @@ class SyncController:
 
     def _launch_mpv(self, index, video_path, pipe_name, monitors, count):
         fullscreen = bool(self.config["display"].get("fullscreen", True))
+        mpv_config = self._mpv_config()
         screen_index = index % max(1, len(monitors))
         monitor = monitors[screen_index]
         args = [
@@ -839,19 +952,26 @@ class SyncController:
             f"--input-ipc-server={pipe_name}",
             "--force-window=yes",
             "--idle=no",
-            "--keep-open=yes",
             "--osd-on-seek=msg-bar",
         ]
+
+        end_behavior = mpv_config.get("end_behavior", "pause_last_frame")
+        if end_behavior == "loop":
+            args.extend(["--keep-open=no", "--loop-file=inf"])
+        elif end_behavior == "next_episode":
+            args.extend(["--keep-open=always", "--loop-file=no"])
+        else:
+            args.extend(["--keep-open=always", "--loop-file=no"])
 
         if self.config["resume"].get("mode") == "remember":
             args.append("--save-position-on-quit=yes")
         else:
             args.extend(["--start=0", "--save-position-on-quit=no"])
 
-        if self.config["mpv"].get("hardware_decoding", True):
+        if mpv_config.get("hardware_decoding", True):
             args.extend(["--hwdec=auto-safe", "--hwdec-codecs=all"])
 
-        if self.config["mpv"].get("disable_subtitles", False):
+        if mpv_config.get("disable_subtitles", False):
             args.extend(["--sid=no", "--sub-visibility=no", "--sub-auto=no"])
 
         if fullscreen:
@@ -863,9 +983,9 @@ class SyncController:
                 f"LAUNCH P{index} fullscreen=False win32_windowed=True monitor={monitor.name or '?'}:{monitor.width}x{monitor.height}+{monitor.x}+{monitor.y} pipe={pipe_name}"
             )
 
-        if index > 0 and self.config["mpv"].get("mute_followers", True):
+        if mpv_config.get("mute_all", False) or (index > 0 and mpv_config.get("mute_followers", True)):
             args.append("--mute=yes")
-        args.extend(self.config["mpv"].get("extra_args", []))
+        args.extend(mpv_config.get("extra_args", []))
 
         launch_args_for_log = [arg for arg in args if not arg.startswith("--input-ipc-server=")]
         debug_log(f"LAUNCH_ARGS P{index} {' | '.join(launch_args_for_log)}")
@@ -985,6 +1105,9 @@ class SyncController:
                 self._schedule_windowed_geometry_fix(self.session_id)
         elif name == "time-pos" and value is not None:
             self._sync_timepos(source, float(value))
+        elif name == "eof-reached" and bool(value):
+            if source.index == 0 and self._active_end_behavior() == "next_episode" and not self._is_remote_client_mode():
+                self._advance_to_next_episode(self.session_id)
 
     def _schedule_windowed_geometry_fix(self, session_id):
         for delay in (0.25, 0.7):
@@ -1098,7 +1221,7 @@ class SyncController:
         if source is not None and source.time_pos is not None:
             target_time = source.time_pos
 
-        threshold = max(0.12, self.config["sync"].get("seek_threshold_seconds", 0.06) * 2)
+        threshold = self._large_drift_threshold()
         debug_log(f"CTRL POST_SEEK_CHECK delay={delay} source=P{source_index} target={target_time} threshold={threshold}")
         for index, client in list(self.clients.items()):
             if index == source_index or client.time_pos is None:
@@ -1191,6 +1314,11 @@ def migrate_config(config):
         config["display"].setdefault("local_sync", True)
     if "mute_right" in config.get("mpv", {}):
         config["mpv"]["mute_followers"] = config["mpv"].pop("mute_right")
+    if "large_drift_threshold_seconds" in config.get("remote", {}):
+        config.setdefault("sync", {}).setdefault(
+            "large_drift_threshold_seconds",
+            config["remote"].pop("large_drift_threshold_seconds"),
+        )
 
 
 def get_display_layout():
@@ -1718,15 +1846,60 @@ class SyncPlayerApp:
         widget.bind("<FocusOut>", lambda event: self.auto_save_settings(), add="+")
         widget.bind("<Return>", lambda event: self.auto_save_settings(), add="+")
 
+    def _clamp_large_drift_threshold(self, value):
+        return max(MIN_LARGE_DRIFT_THRESHOLD_SECONDS, min(MAX_LARGE_DRIFT_THRESHOLD_SECONDS, float(value)))
+
+    def _format_large_drift_threshold(self, value):
+        return f"{self._clamp_large_drift_threshold(value):.2f} 秒"
+
+    def on_large_drift_threshold_changed(self, value):
+        value = self._clamp_large_drift_threshold(value)
+        self.large_drift_threshold.set(value)
+        if hasattr(self, "large_drift_threshold_text"):
+            self.large_drift_threshold_text.set(self._format_large_drift_threshold(value))
+        self.auto_save_settings()
+
+    def reset_large_drift_threshold(self):
+        self.on_large_drift_threshold_changed(DEFAULT_LARGE_DRIFT_THRESHOLD_SECONDS)
+        self._set_status("大漂移纠正阈值已恢复默认。")
+
+    def on_mute_all_changed(self):
+        self._apply_mute_followers_state()
+        self.auto_save_settings()
+
+    def _apply_mute_followers_state(self):
+        if hasattr(self, "mute_followers_checkbox"):
+            if self.mute_all.get():
+                self.mute_followers_checkbox.configure(
+                    state="disabled",
+                    fg_color=("#9ca3af", "#4b5563"),
+                    hover_color=("#9ca3af", "#4b5563"),
+                    border_color=("#9ca3af", "#4b5563"),
+                    checkmark_color=("#e5e7eb", "#d1d5db"),
+                )
+            else:
+                self.mute_followers_checkbox.configure(
+                    state="normal",
+                    fg_color=("#3B8ED0", "#1F6AA5"),
+                    hover_color=("#36719F", "#144870"),
+                    border_color=("#3E454A", "#949A9F"),
+                    checkmark_color=("#DCE4EE", "#DCE4EE"),
+                )
+
     def _build_ui(self):
         self.drop_widgets = []
         self.display_mode = StringVar(value=self.config["display"].get("mode", "auto"))
         self.manual_count = IntVar(value=int(self.config["display"].get("manual_count", 2)))
         self.fullscreen = BooleanVar(value=bool(self.config["display"].get("fullscreen", True)))
         self.local_sync = BooleanVar(value=bool(self.config["display"].get("local_sync", True)))
+        large_drift_value = self._clamp_large_drift_threshold(self.config.get("sync", {}).get("large_drift_threshold_seconds", DEFAULT_LARGE_DRIFT_THRESHOLD_SECONDS))
+        self.large_drift_threshold = DoubleVar(value=large_drift_value)
+        self.large_drift_threshold_text = StringVar(value=self._format_large_drift_threshold(large_drift_value))
         self.resume_mode = StringVar(value=self.config["resume"].get("mode", "start_over"))
+        self.mute_all = BooleanVar(value=bool(self.config["mpv"].get("mute_all", False)))
         self.mute_followers = BooleanVar(value=bool(self.config["mpv"].get("mute_followers", True)))
         self.disable_subtitles = BooleanVar(value=bool(self.config["mpv"].get("disable_subtitles", False)))
+        self.end_behavior = StringVar(value=self.config["mpv"].get("end_behavior", "pause_last_frame"))
         self.hardware_decoding = BooleanVar(value=bool(self.config["mpv"].get("hardware_decoding", True)))
         self.remote_enabled = BooleanVar(value=bool(self.config.get("remote", {}).get("enabled", False)))
         self.remote_mode = StringVar(value=self.config.get("remote", {}).get("mode", "host"))
@@ -1853,13 +2026,33 @@ class SyncPlayerApp:
         self._set_remote_controls_state()
 
         playback_card = self._section_card(content, 3, "播放设置")
+        playback_card.grid_columnconfigure(0, weight=1)
+        playback_card.grid_columnconfigure(1, weight=0)
         ctk.CTkCheckBox(playback_card, text="默认全屏", variable=self.fullscreen, command=self.auto_save_settings, font=self._font(14)).grid(row=0, column=0, sticky="w", padx=16, pady=6)
-        ctk.CTkCheckBox(playback_card, text="第 2 个及之后默认静音", variable=self.mute_followers, command=self.auto_save_settings, font=self._font(14)).grid(row=1, column=0, sticky="w", padx=16, pady=6)
-        ctk.CTkCheckBox(playback_card, text="默认关闭字幕", variable=self.disable_subtitles, command=self.auto_save_settings, font=self._font(14)).grid(row=2, column=0, sticky="w", padx=16, pady=6)
-        ctk.CTkCheckBox(playback_card, text="启用硬件解码", variable=self.hardware_decoding, command=self.auto_save_settings, font=self._font(14)).grid(row=3, column=0, sticky="w", padx=16, pady=6)
-        ctk.CTkLabel(playback_card, text="播放进度", font=self._font(15, "bold"), anchor="w").grid(row=4, column=0, sticky="ew", padx=16, pady=(14, 6))
-        ctk.CTkRadioButton(playback_card, text="每次从头开始", variable=self.resume_mode, value="start_over", command=self.auto_save_settings, font=self._font(14)).grid(row=5, column=0, sticky="w", padx=16, pady=6)
-        ctk.CTkRadioButton(playback_card, text="记住上次播放进度", variable=self.resume_mode, value="remember", command=self.auto_save_settings, font=self._font(14)).grid(row=6, column=0, sticky="w", padx=16, pady=(6, 16))
+        ctk.CTkCheckBox(playback_card, text="全部静音", variable=self.mute_all, command=self.on_mute_all_changed, font=self._font(14)).grid(row=1, column=0, sticky="w", padx=16, pady=6)
+        self.mute_followers_checkbox = ctk.CTkCheckBox(playback_card, text="第 2 个及之后默认静音", variable=self.mute_followers, command=self.auto_save_settings, font=self._font(14))
+        self.mute_followers_checkbox.grid(row=2, column=0, sticky="w", padx=16, pady=6)
+        self._apply_mute_followers_state()
+        ctk.CTkCheckBox(playback_card, text="默认关闭字幕", variable=self.disable_subtitles, command=self.auto_save_settings, font=self._font(14)).grid(row=3, column=0, sticky="w", padx=16, pady=6)
+        ctk.CTkCheckBox(playback_card, text="启用硬件解码", variable=self.hardware_decoding, command=self.auto_save_settings, font=self._font(14)).grid(row=4, column=0, sticky="w", padx=16, pady=6)
+        ctk.CTkLabel(playback_card, text="同步纠正阈值", font=self._font(15, "bold"), anchor="w").grid(row=5, column=0, sticky="w", padx=16, pady=(14, 6))
+        ctk.CTkLabel(playback_card, textvariable=self.large_drift_threshold_text, font=self._font(13, "bold"), anchor="w").grid(row=5, column=1, sticky="e", padx=(8, 16), pady=(14, 6))
+        ctk.CTkSlider(
+            playback_card,
+            variable=self.large_drift_threshold,
+            from_=MIN_LARGE_DRIFT_THRESHOLD_SECONDS,
+            to=MAX_LARGE_DRIFT_THRESHOLD_SECONDS,
+            number_of_steps=95,
+            command=self.on_large_drift_threshold_changed,
+        ).grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 14))
+        ctk.CTkButton(playback_card, text="恢复默认", command=self.reset_large_drift_threshold, width=100, height=32, **self._button_style(13)).grid(row=6, column=1, sticky="e", padx=(8, 16), pady=(0, 14))
+        ctk.CTkLabel(playback_card, text="播放结束后", font=self._font(15, "bold"), anchor="w").grid(row=7, column=0, sticky="ew", padx=16, pady=(14, 6))
+        ctk.CTkRadioButton(playback_card, text="暂停在最后一帧", variable=self.end_behavior, value="pause_last_frame", command=self.auto_save_settings, font=self._font(14)).grid(row=8, column=0, sticky="w", padx=16, pady=6)
+        ctk.CTkRadioButton(playback_card, text="播放下一集", variable=self.end_behavior, value="next_episode", command=self.auto_save_settings, font=self._font(14)).grid(row=9, column=0, sticky="w", padx=16, pady=6)
+        ctk.CTkRadioButton(playback_card, text="循环播放", variable=self.end_behavior, value="loop", command=self.auto_save_settings, font=self._font(14)).grid(row=10, column=0, sticky="w", padx=16, pady=6)
+        ctk.CTkLabel(playback_card, text="播放进度", font=self._font(15, "bold"), anchor="w").grid(row=11, column=0, sticky="ew", padx=16, pady=(14, 6))
+        ctk.CTkRadioButton(playback_card, text="每次从头开始", variable=self.resume_mode, value="start_over", command=self.auto_save_settings, font=self._font(14)).grid(row=12, column=0, sticky="w", padx=16, pady=6)
+        ctk.CTkRadioButton(playback_card, text="记住上次播放进度", variable=self.resume_mode, value="remember", command=self.auto_save_settings, font=self._font(14)).grid(row=13, column=0, sticky="w", padx=16, pady=(6, 16))
 
         status_bar = ctk.CTkFrame(content, corner_radius=10, fg_color=("#dfe6ef", "#151c26"))
         status_bar.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 16))
@@ -1940,6 +2133,13 @@ class SyncPlayerApp:
         if remote_mode not in {"off", "host", "client"}:
             remote_mode = "host"
         remote_enabled = bool(self.remote_enabled.get())
+        large_drift_threshold = self._clamp_large_drift_threshold(self.large_drift_threshold.get())
+        self.large_drift_threshold.set(large_drift_threshold)
+        if hasattr(self, "large_drift_threshold_text"):
+            self.large_drift_threshold_text.set(self._format_large_drift_threshold(large_drift_threshold))
+        end_behavior = self.end_behavior.get()
+        if end_behavior not in {"pause_last_frame", "next_episode", "loop"}:
+            end_behavior = "pause_last_frame"
         remote_host = self.remote_host.get().strip() or "0.0.0.0"
         remote_connect_host = self.remote_connect_host.get().strip()
         remote_connect_to = f"{remote_connect_host}:{remote_connect_port}"
@@ -1951,9 +2151,12 @@ class SyncPlayerApp:
         self.config["display"]["manual_count"] = manual_count
         self.config["display"]["fullscreen"] = bool(self.fullscreen.get())
         self.config["display"]["local_sync"] = bool(self.local_sync.get())
+        self.config["sync"]["large_drift_threshold_seconds"] = large_drift_threshold
         self.config["resume"]["mode"] = self.resume_mode.get()
+        self.config["mpv"]["mute_all"] = bool(self.mute_all.get())
         self.config["mpv"]["mute_followers"] = bool(self.mute_followers.get())
         self.config["mpv"]["disable_subtitles"] = bool(self.disable_subtitles.get())
+        self.config["mpv"]["end_behavior"] = end_behavior
         self.config["mpv"]["hardware_decoding"] = bool(self.hardware_decoding.get())
         self.config.setdefault("remote", {})["enabled"] = remote_enabled
         self.config.setdefault("remote", {})["mode"] = remote_mode

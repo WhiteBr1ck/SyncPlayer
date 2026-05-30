@@ -30,6 +30,9 @@ mpv/portable_config/logs/
 # Local packaged executable copy
 SyncPlayer.exe
 
+# Unused local icon export
+assets/syncplayer.ico
+
 # OS/editor
 .DS_Store
 Thumbs.db
