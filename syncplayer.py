@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import os
 import queue
@@ -6,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BooleanVar, DoubleVar, IntVar, PhotoImage, StringVar, filedialog, messagebox
@@ -42,7 +44,7 @@ except ImportError:
 
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "0.0.7"
+APP_VERSION = "0.0.8"
 DPI_SCALE = 1.0
 DEBUG_LOG_PATH = None
 DEBUG_LOG_LOCK = threading.Lock()
@@ -115,6 +117,109 @@ def debug_log(message):
                 file.write(line)
     except Exception:
         pass
+
+
+def local_lan_addresses():
+    addresses = set()
+    hostname = socket.gethostname()
+    candidates = []
+    try:
+        candidates.extend(socket.gethostbyname_ex(hostname)[2])
+    except Exception:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            candidates.append(sock.getsockname()[0])
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if address.version == 4 and address.is_private and not address.is_loopback and not address.is_link_local:
+            addresses.add(str(address))
+
+    def sort_key(value):
+        if value.startswith("192.168."):
+            group = 0
+        elif value.startswith("10."):
+            group = 1
+        elif value.startswith("172."):
+            group = 2
+        else:
+            group = 3
+        return group, tuple(int(part) for part in value.split("."))
+
+    return sorted(addresses, key=sort_key)
+
+
+def firewall_status_text():
+    try:
+        result = subprocess.run(
+            ["netsh", "advfirewall", "show", "allprofiles", "state"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=5,
+        )
+    except Exception as exc:
+        debug_log(f"FIREWALL_STATUS_FAIL error={exc}")
+        return "读取失败"
+    if result.returncode != 0:
+        debug_log(f"FIREWALL_STATUS_FAIL code={result.returncode} stderr={result.stderr.strip()}")
+        return "读取失败"
+    states = []
+    for line in result.stdout.splitlines():
+        if "状态" in line or "State" in line:
+            value = line.split()[-1].strip().lower()
+            if value in {"on", "启用", "開啟"}:
+                states.append(True)
+            elif value in {"off", "禁用", "关闭", "關閉"}:
+                states.append(False)
+    if not states:
+        return "读取失败"
+    if all(states):
+        return "已启用"
+    if not any(states):
+        return "已关闭"
+    return "部分启用"
+
+
+def syncplayer_probe(host, port, timeout=0.35):
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+        request = {"type": "time_sync", "client_send_time": time.monotonic()}
+        sock.sendall(json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n")
+        buffer = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                message = json.loads(line.decode("utf-8", errors="replace"))
+                if message.get("type") == "time_sync_response":
+                    return True
+    except Exception:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return False
 
 
 @dataclass
@@ -1448,7 +1553,9 @@ class SyncPlayerApp:
         self.remote_client = None
         self.initial_video = initial_video
         self.auto_save_after_id = None
+        self.remote_auto_save_after_id = None
         self.fast_scroll_active = False
+        self.local_host_addresses = []
 
         self.font_family = "Microsoft YaHei UI"
         initial_theme = self.config.get("ui", {}).get("theme", "system")
@@ -1590,6 +1697,51 @@ class SyncPlayerApp:
     def _set_status(self, text):
         if hasattr(self, "status_text"):
             self.status_text.set(text)
+
+    def _center_window(self, window, width, height):
+        self.root.update_idletasks()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_width = max(1, self.root.winfo_width())
+        root_height = max(1, self.root.winfo_height())
+        x = root_x + max(0, (root_width - width) // 2)
+        y = root_y + max(0, (root_height - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _remote_port_value(self):
+        try:
+            return int(self.remote_port.get())
+        except Exception:
+            return int(self.config.get("remote", {}).get("port", 6090))
+
+    def _host_addresses_with_port(self):
+        port = self._remote_port_value()
+        return [f"{address}:{port}" for address in self.local_host_addresses]
+
+    def refresh_host_network_info(self):
+        self.local_host_addresses = local_lan_addresses()
+        addresses = self._host_addresses_with_port()
+        if hasattr(self, "host_address_text"):
+            self.host_address_text.set(addresses[0] if addresses else "未检测到局域网地址")
+        if hasattr(self, "firewall_status_text"):
+            self.firewall_status_text.set(firewall_status_text())
+
+    def show_host_addresses(self):
+        self.refresh_host_network_info()
+        addresses = self._host_addresses_with_port()
+        if not addresses:
+            messagebox.showinfo(APP_NAME, "未检测到可用的局域网 IPv4 地址。")
+            return
+        window = ctk.CTkToplevel(self.root)
+        window.title("本机地址")
+        self._center_window(window, 420, 260)
+        window.transient(self.root)
+        window.grab_set()
+        window.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(window, text="可用本机地址", font=self._font(18, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        for row, address in enumerate(addresses, start=1):
+            ctk.CTkLabel(window, text=address, font=self._font(14), anchor="w").grid(row=row, column=0, sticky="ew", padx=18, pady=5)
+        ctk.CTkButton(window, text="关闭", command=window.destroy, width=100, **self._button_style(13)).grid(row=len(addresses) + 1, column=0, sticky="e", padx=18, pady=(12, 18))
 
     def _bind_fast_scroll(self, widget):
         widget.bind("<Enter>", lambda event: self._set_fast_scroll_active(True), add="+")
@@ -1774,6 +1926,106 @@ class SyncPlayerApp:
                 except Exception:
                     pass
 
+    def search_remote_hosts(self):
+        try:
+            port = int(self.remote_connect_port.get())
+            if port < 1 or port > 65535:
+                raise ValueError
+        except Exception:
+            messagebox.showerror(APP_NAME, "搜索主机前，请先填写有效端口，例如 6090。")
+            return
+        window = ctk.CTkToplevel(self.root)
+        window.title("搜索主机")
+        self._center_window(window, 460, 340)
+        window.transient(self.root)
+        window.grab_set()
+        window.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(window, text="搜索局域网 SyncPlayer 主机", font=self._font(18, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        result_frame = ctk.CTkScrollableFrame(window, corner_radius=10)
+        result_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        result_frame.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(result_frame, text="正在搜索...", font=self._font(14), anchor="w").grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        ctk.CTkButton(window, text="关闭", command=window.destroy, width=100, **self._button_style(13)).grid(row=2, column=0, sticky="e", padx=18, pady=(0, 18))
+        self._set_status("正在搜索局域网 SyncPlayer 主机...")
+        for widget in getattr(self, "remote_client_widgets", []):
+            try:
+                widget.configure(state="disabled")
+            except Exception:
+                pass
+        threading.Thread(target=self._search_remote_hosts_worker, args=(port, window, result_frame), daemon=True).start()
+
+    def _search_remote_hosts_worker(self, port, window, result_frame):
+        local_addresses = local_lan_addresses()
+        targets = []
+        seen = set()
+        for address in local_addresses:
+            try:
+                network = ipaddress.ip_network(f"{address}/24", strict=False)
+            except ValueError:
+                continue
+            for host in network.hosts():
+                host_text = str(host)
+                if host_text == address or host_text in seen:
+                    continue
+                seen.add(host_text)
+                targets.append(host_text)
+
+        found = []
+        if targets:
+            with ThreadPoolExecutor(max_workers=64) as executor:
+                future_to_host = {executor.submit(syncplayer_probe, host, port): host for host in targets}
+                for future in as_completed(future_to_host):
+                    host = future_to_host[future]
+                    try:
+                        if future.result():
+                            found.append(host)
+                    except Exception:
+                        pass
+        found.sort(key=lambda value: tuple(int(part) for part in value.split(".")))
+        self.root.after(0, lambda: self._finish_remote_host_search(found, port, window, result_frame))
+
+    def _finish_remote_host_search(self, hosts, port, window, result_frame):
+        self._set_remote_controls_state()
+        try:
+            window_exists = window.winfo_exists()
+            result_frame_exists = result_frame.winfo_exists()
+        except Exception:
+            return
+        if not window_exists or not result_frame_exists:
+            return
+        for child in result_frame.winfo_children():
+            child.destroy()
+        if not hosts:
+            self._set_status("未发现局域网 SyncPlayer 主机。")
+            ctk.CTkLabel(
+                result_frame,
+                text="未发现主机。请确认主机已启用局域网同步、防火墙允许访问，并且端口一致。",
+                font=self._font(14),
+                anchor="w",
+                wraplength=390,
+                justify="left",
+            ).grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+            return
+        self._set_status(f"发现 {len(hosts)} 个 SyncPlayer 主机，请选择。")
+        ctk.CTkLabel(result_frame, text="请选择要连接的主机：", font=self._font(14), anchor="w").grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        for row, host in enumerate(hosts, start=1):
+            address = f"{host}:{port}"
+            ctk.CTkButton(
+                result_frame,
+                text=address,
+                command=lambda selected_host=host: (self._apply_remote_host_result(selected_host, port), window.destroy()),
+                height=34,
+                anchor="w",
+                **self._button_style(13),
+            ).grid(row=row, column=0, sticky="ew", padx=12, pady=4)
+
+    def _apply_remote_host_result(self, host, port):
+        self.remote_connect_host.set(host)
+        self.remote_connect_port.set(port)
+        self._set_status(f"已选择主机：{host}:{port}")
+        self.auto_save_remote_settings()
+
     def apply_remote_settings(self):
         try:
             self.apply_ui_to_config(require_confirmations=False)
@@ -1790,28 +2042,46 @@ class SyncPlayerApp:
 
     def on_remote_enabled_changed(self):
         self._set_remote_controls_state()
-        try:
-            self.apply_ui_to_config(require_confirmations=False)
-            save_config(self.base_dir, self.config)
-            self._configure_remote_sync()
-            self._set_status("局域网同步设置已自动保存。")
-        except Exception as exc:
-            debug_log(f"UI REMOTE_TOGGLE_SAVE_FAIL error={exc}")
+        self.auto_save_remote_settings()
 
     def _set_remote_controls_state(self):
         if not hasattr(self, "remote_setting_widgets"):
             return
         enabled = bool(self.remote_enabled.get())
+        is_host = self.remote_mode.get() == "host"
+        is_client = self.remote_mode.get() == "client"
         state = "normal" if enabled else "disabled"
         for widget in self.remote_setting_widgets:
             try:
                 widget.configure(state=state)
             except Exception:
                 pass
+        for widget in getattr(self, "remote_host_widgets", []):
+            try:
+                widget.configure(state="normal" if enabled and is_host else "disabled")
+            except Exception:
+                pass
+        for widget in getattr(self, "remote_client_widgets", []):
+            try:
+                widget.configure(state="normal" if enabled and is_client else "disabled")
+            except Exception:
+                pass
         text_color = ("gray10", "gray90") if enabled else ("gray55", "gray45")
         for widget in getattr(self, "remote_setting_labels", []):
             try:
                 widget.configure(text_color=text_color)
+            except Exception:
+                pass
+        host_text_color = ("gray10", "gray90") if enabled and is_host else ("gray55", "gray45")
+        for widget in getattr(self, "remote_host_labels", []):
+            try:
+                widget.configure(text_color=host_text_color)
+            except Exception:
+                pass
+        client_text_color = ("gray10", "gray90") if enabled and is_client else ("gray55", "gray45")
+        for widget in getattr(self, "remote_client_labels", []):
+            try:
+                widget.configure(text_color=client_text_color)
             except Exception:
                 pass
         entry_text_color = ("black", "white") if enabled else ("gray55", "gray45")
@@ -1858,6 +2128,31 @@ class SyncPlayerApp:
         if hasattr(self, "large_drift_threshold_text"):
             self.large_drift_threshold_text.set(self._format_large_drift_threshold(value))
         self.auto_save_settings()
+
+    def auto_save_remote_settings(self):
+        if self.remote_auto_save_after_id is not None:
+            self.root.after_cancel(self.remote_auto_save_after_id)
+        self.remote_auto_save_after_id = self.root.after(350, self._flush_auto_save_remote_settings)
+
+    def _flush_auto_save_remote_settings(self):
+        self.remote_auto_save_after_id = None
+        try:
+            self.apply_ui_to_config(require_confirmations=False)
+            save_config(self.base_dir, self.config)
+            self._configure_remote_sync()
+            self.refresh_host_network_info()
+            self._set_remote_controls_state()
+            self._set_status("局域网同步设置已自动保存。")
+        except Exception as exc:
+            debug_log(f"UI REMOTE_AUTO_SAVE_FAIL error={exc}")
+            self._set_status("局域网同步设置自动保存失败。")
+
+    def _on_remote_port_key(self, event):
+        self.root.after(50, self.refresh_host_network_info)
+
+    def _bind_remote_auto_save_entry(self, widget):
+        widget.bind("<FocusOut>", lambda event: self.auto_save_remote_settings(), add="+")
+        widget.bind("<Return>", lambda event: self.auto_save_remote_settings(), add="+")
 
     def reset_large_drift_threshold(self):
         self.on_large_drift_threshold_changed(DEFAULT_LARGE_DRIFT_THRESHOLD_SECONDS)
@@ -1912,6 +2207,12 @@ class SyncPlayerApp:
         self.remote_setting_labels = []
         self.remote_setting_entries = []
         self.remote_setting_buttons = []
+        self.remote_host_widgets = []
+        self.remote_host_labels = []
+        self.remote_client_widgets = []
+        self.remote_client_labels = []
+        self.host_address_text = StringVar(value="正在检测...")
+        self.firewall_status_text = StringVar(value="正在检测...")
         self.status_text = StringVar(value="等待视频：拖入视频文件，或点击按钮选择视频。")
 
         self.root.grid_columnconfigure(0, weight=1)
@@ -1988,9 +2289,9 @@ class SyncPlayerApp:
 
         remote_card = self._section_card(content, 2, "局域网多屏同步", self.remote_enabled, self.on_remote_enabled_changed)
         remote_card.grid_columnconfigure(3, weight=1)
-        remote_host_radio = ctk.CTkRadioButton(remote_card, text="作为主机", variable=self.remote_mode, value="host", command=self.auto_save_settings, font=self._font(14))
+        remote_host_radio = ctk.CTkRadioButton(remote_card, text="作为主机", variable=self.remote_mode, value="host", command=self.auto_save_remote_settings, font=self._font(14))
         remote_host_radio.grid(row=0, column=0, sticky="w", padx=16, pady=6)
-        remote_client_radio = ctk.CTkRadioButton(remote_card, text="作为从机", variable=self.remote_mode, value="client", command=self.auto_save_settings, font=self._font(14))
+        remote_client_radio = ctk.CTkRadioButton(remote_card, text="作为从机", variable=self.remote_mode, value="client", command=self.auto_save_remote_settings, font=self._font(14))
         remote_client_radio.grid(row=0, column=1, sticky="w", padx=8, pady=6)
         self.remote_setting_widgets.extend([remote_host_radio, remote_client_radio])
         remote_host_label = ctk.CTkLabel(remote_card, text="主机监听地址", font=self._font(13), anchor="w")
@@ -1999,31 +2300,50 @@ class SyncPlayerApp:
         remote_port_label.grid(row=2, column=1, sticky="w", padx=8, pady=(12, 4))
         remote_host_entry = ctk.CTkEntry(remote_card, textvariable=self.remote_host, width=170, font=self._font(13))
         remote_host_entry.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 10))
-        self._bind_auto_save_entry(remote_host_entry)
+        self._bind_remote_auto_save_entry(remote_host_entry)
         remote_port_entry = ctk.CTkEntry(remote_card, textvariable=self.remote_port, width=92, font=self._font(13), justify="center")
         remote_port_entry.grid(row=3, column=1, sticky="w", padx=8, pady=(0, 10))
-        self._bind_auto_save_entry(remote_port_entry)
+        self._bind_remote_auto_save_entry(remote_port_entry)
+        remote_port_entry.bind("<KeyRelease>", self._on_remote_port_key, add="+")
         self.remote_setting_widgets.extend([remote_host_entry, remote_port_entry])
+        self.remote_host_widgets.extend([remote_host_entry, remote_port_entry])
         self.remote_setting_entries.extend([remote_host_entry, remote_port_entry])
+        self.remote_host_labels.extend([remote_host_label, remote_port_label])
+        host_address_label = ctk.CTkLabel(remote_card, text="本机地址", font=self._font(13), anchor="w")
+        host_address_label.grid(row=4, column=0, sticky="w", padx=16, pady=(4, 4))
+        host_address_button = ctk.CTkButton(remote_card, textvariable=self.host_address_text, command=self.show_host_addresses, height=30, anchor="w", font=self._font(13), fg_color="transparent", text_color=("#1f5f99", "#7ab7ff"), hover_color=("#e7edf6", "#1d2938"))
+        host_address_button.grid(row=5, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 8))
+        refresh_host_button = ctk.CTkButton(remote_card, text="刷新", command=self.refresh_host_network_info, width=80, height=30, **self._button_style(13))
+        refresh_host_button.grid(row=5, column=2, sticky="w", padx=8, pady=(0, 8))
+        firewall_label = ctk.CTkLabel(remote_card, text="防火墙", font=self._font(13), anchor="w")
+        firewall_label.grid(row=6, column=0, sticky="w", padx=16, pady=(0, 4))
+        firewall_value_label = ctk.CTkLabel(remote_card, textvariable=self.firewall_status_text, font=self._font(13, "bold"), anchor="w")
+        firewall_value_label.grid(row=6, column=1, sticky="w", padx=8, pady=(0, 4))
+        self.remote_host_widgets.extend([host_address_button, refresh_host_button])
+        self.remote_host_labels.extend([host_address_label, firewall_label, firewall_value_label])
         remote_connect_host_label = ctk.CTkLabel(remote_card, text="从机连接主机地址", font=self._font(13), anchor="w")
-        remote_connect_host_label.grid(row=4, column=0, sticky="w", padx=16, pady=(8, 4))
+        remote_connect_host_label.grid(row=7, column=0, sticky="w", padx=16, pady=(12, 4))
         remote_connect_port_label = ctk.CTkLabel(remote_card, text="端口", font=self._font(13), anchor="w")
-        remote_connect_port_label.grid(row=4, column=1, sticky="w", padx=8, pady=(8, 4))
+        remote_connect_port_label.grid(row=7, column=1, sticky="w", padx=8, pady=(12, 4))
         remote_connect_host_entry = ctk.CTkEntry(remote_card, textvariable=self.remote_connect_host, width=170, font=self._font(13))
-        remote_connect_host_entry.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 14))
-        self._bind_auto_save_entry(remote_connect_host_entry)
+        remote_connect_host_entry.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self._bind_remote_auto_save_entry(remote_connect_host_entry)
         remote_connect_port_entry = ctk.CTkEntry(remote_card, textvariable=self.remote_connect_port, width=92, font=self._font(13), justify="center")
-        remote_connect_port_entry.grid(row=5, column=1, sticky="w", padx=8, pady=(0, 14))
-        self._bind_auto_save_entry(remote_connect_port_entry)
+        remote_connect_port_entry.grid(row=8, column=1, sticky="w", padx=8, pady=(0, 14))
+        self._bind_remote_auto_save_entry(remote_connect_port_entry)
         test_button = ctk.CTkButton(remote_card, text="测试连接", command=self.test_remote_connection, width=100, height=32, **self._button_style(13))
-        test_button.grid(row=5, column=2, sticky="w", padx=8, pady=(0, 14))
+        test_button.grid(row=8, column=2, sticky="w", padx=8, pady=(0, 14))
+        search_button = ctk.CTkButton(remote_card, text="搜索主机", command=self.search_remote_hosts, width=100, height=32, **self._button_style(13))
+        search_button.grid(row=8, column=3, sticky="w", padx=8, pady=(0, 14))
         save_remote_button = ctk.CTkButton(remote_card, text="保存局域网设置", command=self.apply_remote_settings, height=36, **self._button_style(13))
-        save_remote_button.grid(row=6, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 16))
-        self.remote_setting_widgets.extend([remote_connect_host_entry, remote_connect_port_entry, test_button, save_remote_button])
+        save_remote_button.grid(row=9, column=0, columnspan=4, sticky="ew", padx=16, pady=(0, 16))
+        self.remote_setting_widgets.extend([remote_connect_host_entry, remote_connect_port_entry, test_button, search_button, save_remote_button])
+        self.remote_client_widgets.extend([remote_connect_host_entry, remote_connect_port_entry, test_button, search_button])
         self.remote_setting_entries.extend([remote_connect_host_entry, remote_connect_port_entry])
-        self.remote_setting_buttons.extend([test_button, save_remote_button])
-        self.remote_setting_labels.extend([remote_host_label, remote_port_label, remote_connect_host_label, remote_connect_port_label])
+        self.remote_setting_buttons.extend([test_button, search_button, save_remote_button])
+        self.remote_client_labels.extend([remote_connect_host_label, remote_connect_port_label])
         self._set_remote_controls_state()
+        self.refresh_host_network_info()
 
         playback_card = self._section_card(content, 3, "播放设置")
         playback_card.grid_columnconfigure(0, weight=1)
