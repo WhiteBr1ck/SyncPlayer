@@ -13,6 +13,7 @@ build.bat
 
 # Local development notes
 CLAUDE.md
+AGENTS.md
 
 # Local runtime logs and user state
 syncplayer.json

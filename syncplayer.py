@@ -44,7 +44,7 @@ except ImportError:
 
 
 APP_NAME = "SyncPlayer"
-APP_VERSION = "0.0.8"
+APP_VERSION = "0.0.9"
 DPI_SCALE = 1.0
 DEBUG_LOG_PATH = None
 DEBUG_LOG_LOCK = threading.Lock()
